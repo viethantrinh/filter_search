@@ -133,8 +133,38 @@ class IVFIndex:
         self.list_ptr = np.zeros(C + 1, dtype=np.int64)
         np.cumsum(counts, out=self.list_ptr[1:])
 
+        # ---- Global label-sorted view (for the exact pre-filter fallback) ----
+        # When a filter is very selective, the surviving subset is tiny and an
+        # EXACT brute-force KNN over it is both fast AND recall=1.0. We sort all
+        # ids by label once so that, for any range [lo,hi], the surviving ids are
+        # a single contiguous slice found via two binary searches.
+        g_order = np.argsort(self.labels, kind="stable")
+        self._global_ids_by_label = g_order.astype(np.int32)   # (N,)
+        self._global_sorted_labels = self.labels[g_order]       # (N,)
+
         print(f"[IVF] Build done: {N:,} vectors | {C} lists | "
               f"avg list size = {N / C:.1f} | {time.perf_counter() - t0:.2f}s")
+
+    # ------------------------------------------------------------------
+    # Exact KNN over the filtered subset (used as a fallback for selective
+    # filters). Fast because the surviving ids are one contiguous slice of the
+    # globally label-sorted id array.
+    # ------------------------------------------------------------------
+
+    def _exact_filtered_knn(self, qv: np.ndarray, lo: int, hi: int,
+                            k: int) -> np.ndarray:
+        sl = self._global_sorted_labels
+        a = np.searchsorted(sl, lo, side="left")
+        b = np.searchsorted(sl, hi, side="right")
+        if b <= a:
+            return np.empty(0, dtype=np.int32)
+        cand = self._global_ids_by_label[a:b]
+        diff = self.base_vecs[cand] - qv
+        dist = np.einsum("nd,nd->n", diff, diff)
+        keff = min(k, len(cand))
+        top = np.argpartition(dist, keff - 1)[:keff]
+        top = top[np.argsort(dist[top])]
+        return cand[top]
 
     # ------------------------------------------------------------------
     # Search
@@ -144,15 +174,28 @@ class IVFIndex:
                      query_vecs: np.ndarray,
                      filter_ranges: np.ndarray,
                      k: int = 50,
-                     nprobe: int = 16) -> tuple[list[np.ndarray], float]:
+                     nprobe: int = 16,
+                     pre_filter_threshold: int = 0) -> tuple[list[np.ndarray], float]:
         """
-        Filtered ANN search for all queries.
+        HYBRID filtered ANN search for all queries (recall-boosting version).
 
-        Steps:
+        Per-query strategy selection (the UNIFY/iRangeGraph idea):
+          * If the filter is SELECTIVE (the surviving subset has <=
+            `pre_filter_threshold` points), the IVF path would have very few
+            candidates and low recall -> instead run an EXACT pre-filter KNN.
+            The subset is small, so this is fast AND gives recall = 1.0.
+          * Otherwise use the IVF path: probe the nprobe nearest lists, slice by
+            label range (label-sorted lists -> searchsorted), rerank by L2.
+
+        Set `pre_filter_threshold = 0` to disable the fallback (pure IVF).
+        A good starting value is a few thousand (e.g. 2000-5000): big enough that
+        exact KNN over the subset is still cheap, small enough to rescue the
+        selective-filter queries where IVF recall collapses.
+
+        Steps for the IVF path:
           1. ONE matmul to score queries against all centroids.
           2. Pick the nprobe nearest lists per query (argpartition).
-          3. For each query: gather members of those lists, slice by label range
-             (lists are label-sorted -> searchsorted), rerank by exact L2.
+          3. Gather members of those lists, slice by label range, rerank by L2.
 
         Returns (results, elapsed_seconds).
         """
@@ -162,6 +205,15 @@ class IVFIndex:
         hi_arr = filter_ranges[:, 1].astype(np.int32)
 
         t0 = time.perf_counter()
+
+        # Pre-compute, for every query, how many base vectors survive the filter.
+        # Two binary searches into the globally label-sorted labels -> O(log N).
+        sl = self._global_sorted_labels
+        lo_pos = np.searchsorted(sl, lo_arr, side="left")
+        hi_pos = np.searchsorted(sl, hi_arr, side="right")
+        survive = hi_pos - lo_pos                                   # (Q,) ints
+
+        use_exact = (pre_filter_threshold > 0) & (survive <= pre_filter_threshold)
 
         # (1) Coarse assignment for all queries in one matmul.
         c_sq = np.einsum("cd,cd->c", self.centroids, self.centroids)
@@ -179,6 +231,12 @@ class IVFIndex:
             qv = query_vecs[q]
             lo, hi = lo_arr[q], hi_arr[q]
 
+            # ---- Exact fallback for selective filters (recall = 1.0) ----
+            if use_exact[q]:
+                results.append(self._exact_filtered_knn(qv, lo, hi, k))
+                continue
+
+            # ---- IVF path ----
             id_parts = []
             for c in probe[q]:
                 s, e = ptr[c], ptr[c + 1]

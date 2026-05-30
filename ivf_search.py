@@ -34,6 +34,7 @@ class IVFFilteredSearch:
                  labels: np.ndarray,
                  n_centroids: int = 1024,
                  nprobe: int = 16,
+                 pre_filter_threshold: int = 0,
                  n_iter: int = 10,
                  seed: int = 42,
                  # swallow LSH-style kwargs so it's a true drop-in:
@@ -41,6 +42,7 @@ class IVFFilteredSearch:
         self.base_vecs = base_vecs
         self.labels = labels
         self.nprobe = nprobe
+        self.pre_filter_threshold = pre_filter_threshold
         self.N, self.D = base_vecs.shape
 
         self.index = IVFIndex(n_centroids=n_centroids, n_iter=n_iter, seed=seed)
@@ -51,7 +53,8 @@ class IVFFilteredSearch:
 
     def batch_search(self, query_vecs, filter_ranges, k: int = 50):
         return self.index.batch_search(query_vecs, filter_ranges, k=k,
-                                        nprobe=self.nprobe)
+                                        nprobe=self.nprobe,
+                                        pre_filter_threshold=self.pre_filter_threshold)
 
     # single-query convenience (not used in the main benchmark loop)
     def search(self, query, lo, hi, k: int = 50):

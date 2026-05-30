@@ -50,6 +50,10 @@ def parse_args():
     p.add_argument("--centroids", type=int, nargs="+", default=[4096])
     p.add_argument("--nprobe", type=int, nargs="+", default=[8, 16, 24, 32, 48])
     p.add_argument("--n-iter", type=int, default=10, help="k-means iterations")
+    p.add_argument("--pre-thr", type=int, nargs="+", default=[0],
+                   help="pre_filter_threshold values to sweep. If the filtered "
+                        "subset has <= this many points, fall back to EXACT KNN "
+                        "(recall=1.0). 0 disables. Try 0 2000 5000 10000.")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -97,35 +101,39 @@ def main():
     # ------------------------------------------------------------------
     # Sweep
     # ------------------------------------------------------------------
-    print("\n" + "=" * 64)
-    print(f"  {'centroids':>9} {'nprobe':>7} {'Recall@K':>9} {'QPS':>10} {'SCORE':>9}")
-    print("=" * 64)
+    print("\n" + "=" * 74)
+    print(f"  {'centroids':>9} {'nprobe':>7} {'pre_thr':>8} "
+          f"{'Recall@K':>9} {'QPS':>10} {'SCORE':>9}")
+    print("=" * 74)
 
     best = None
     for C in args.centroids:
-        # Build the index once per centroid count, reuse across nprobe values.
+        # Build the index once per centroid count, reuse across nprobe/threshold.
         searcher = IVFFilteredSearch(base, labels, n_centroids=C,
                                      nprobe=max(args.nprobe), n_iter=args.n_iter,
                                      seed=args.seed)
         for nprobe in sorted(args.nprobe):
             searcher.nprobe = nprobe
-            res, t = searcher.batch_search(query, fr, k=args.k)
-            R = compute_recall(res, gt)["mean_recall"]
-            QPS = compute_qps(Q, t)
-            S = (QPS / 100) * (R ** 2)
-            marker = ""
-            if best is None or S > best[0]:
-                best = (S, C, nprobe, R, QPS)
-                marker = "  <- best so far"
-            print(f"  {C:>9} {nprobe:>7} {R:>9.4f} {QPS:>10.1f} {S:>9.4f}{marker}")
+            for thr in sorted(args.pre_thr):
+                searcher.pre_filter_threshold = thr
+                res, t = searcher.batch_search(query, fr, k=args.k)
+                R = compute_recall(res, gt)["mean_recall"]
+                QPS = compute_qps(Q, t)
+                S = (QPS / 100) * (R ** 2)
+                marker = ""
+                if best is None or S > best[0]:
+                    best = (S, C, nprobe, thr, R, QPS)
+                    marker = "  <- best so far"
+                print(f"  {C:>9} {nprobe:>7} {thr:>8} "
+                      f"{R:>9.4f} {QPS:>10.1f} {S:>9.4f}{marker}")
 
-    print("=" * 64)
-    S, C, nprobe, R, QPS = best
-    print(f"\nBEST: n_centroids={C}  nprobe={nprobe}  "
+    print("=" * 74)
+    S, C, nprobe, thr, R, QPS = best
+    print(f"\nBEST: n_centroids={C}  nprobe={nprobe}  pre_filter_threshold={thr}  "
           f"Recall@{args.k}={R:.4f}  QPS={QPS:.1f}  SCORE={S:.4f}")
     print("\nPlug into main.py:")
     print(f"    post = PostFilterSearch(base_vecs, labels, "
-          f"n_centroids={C}, nprobe={nprobe})")
+          f"n_centroids={C}, nprobe={nprobe}, pre_filter_threshold={thr})")
 
 
 if __name__ == "__main__":
